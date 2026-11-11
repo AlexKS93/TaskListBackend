@@ -1,3 +1,4 @@
+import os
 import datetime
 from typing import List, Optional
 import jwt
@@ -15,21 +16,31 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.orm import joinedload
 from sqlalchemy import ForeignKey, select, or_, and_, func
 
-
+# 🔌 ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ .ENV
+from dotenv import load_dotenv
+load_dotenv()
 
 # ==================== НАСТРОЙКИ LDAP И JWT ====================
 # Укажите данные вашего LDAP / Active Directory сервера
-LDAP_SERVER = "ldap://hnpz-dc-03" 
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default_fallback_secret_key_change_me")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 480))
 
-LDAP_DOMAIN = "ipc-oil.ru"  # Например, 'company.com'
-# Шаблон для авторизации: user@domain.local
-LDAP_USER_DN_TEMPLATE = "aleksandr.skabelkin@" + LDAP_DOMAIN 
-LDAP_SEARCH_BASE = "OU=IT,OU=Users,OU=HNPZ,OU=DZO,OU=OUs,DC=ipc-oil,DC=ru" 
-ALLOWED_GROUP_DN = "CN=HNPZ-UITIM-ASUTP-W,OU=Groups,DC=IPC-OIL,DC=ru"
-JWT_SECRET_KEY = "7c2ee9233c1835968fab0a5e6d4044b68ede88f80223ad648fd78443fd2385ef"  # Поменяйте в продакшене!
-JWT_ALGORITHM = "HS256"
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 480  # Токен на 8 часов (рабочий день)
+LDAP_SERVER = os.getenv("LDAP_SERVER")
+LDAP_DOMAIN = os.getenv("LDAP_DOMAIN")
+# Формируем шаблон на основе переменной домена
+LDAP_USER_DN_TEMPLATE = "{username}@" + (LDAP_DOMAIN or "ipc-oil.ru")
+LDAP_SEARCH_BASE = os.getenv("LDAP_SEARCH_BASE")
+ALLOWED_GROUP_DN = os.getenv("ALLOWED_GROUP_DN")
 
+# Считываем строку логинов начальников и преобразуем в список Python
+raw_boss_logins = os.getenv("BOSS_LOGINS", "admin")
+BOSS_LOGINS = [login.strip() for login in raw_boss_logins.split(",")]
+
+
+#DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./database.db")
+# ==============================================================================
+BOSS_LOGINS = ["aleksandr.skabelkin", "admin", "chief_asutp"] 
 # fastapi инструмент для извлечения токена из заголовка Authorization: Bearer <TOKEN>
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -38,6 +49,7 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str
     username: str
+    sys_username: str 
 
 # Добавьте в существующий код базы данных и Pydantic...
 # (Код моделей ObjectModel, TaskModel и схем TaskResponse остается без изменений)
@@ -45,10 +57,23 @@ class TokenResponse(BaseModel):
 
 
 # 1. Настройка базы данных SQLite (Асинхронный режим)
-DATABASE_URL = "sqlite+aiosqlite:///./database.db"
-engine = create_async_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-async_session = async_sessionmaker(engine, expire_on_commit=False)
+#DATABASE_URL = "sqlite+aiosqlite:///./database.db"
+# ==================== КРОСС-ПЛАТФОРМЕННАЯ НАСТРОЙКА БАЗЫ ДАННЫХ ====================
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./database.db")
 
+# Конфигурация аргументов подключения в зависимости от СУБД и Операционной Системы
+connect_args = {}
+if "sqlite" in DATABASE_URL:
+    # check_same_thread=False необходим для асинхронной работы SQLite в FastAPI,
+    # но мы безопасно изолируем его для стабильности под управлением разных ОС.
+    connect_args["check_same_thread"] = False
+
+engine = create_async_engine(
+    DATABASE_URL, 
+    connect_args=connect_args
+)
+async_session = async_sessionmaker(engine, expire_on_commit=False)
+# ==============================================================================
 # Зависимость для получения сессии БД в эндпоинтах
 async def get_db():
     async with async_session() as session:
@@ -124,6 +149,26 @@ class PaginatedTaskResponse(BaseModel):
     offset: int
     results: List[TaskResponse]
 
+class ObjectStat(BaseModel):
+    object_name: str
+    count: int
+
+class UserStat(BaseModel):
+    who: str
+    count: int
+
+class StatusStat(BaseModel):
+    status: str
+    count: int
+
+class AnalyticsResponse(BaseModel):
+    by_objects: List[ObjectStat]
+    by_users: List[UserStat]
+    by_statuses: List[StatusStat]
+    total_tasks: int
+
+
+
 # 4. Инициализация FastAPI и CORS
 app = FastAPI(title="Task & Object Management API")
 
@@ -134,6 +179,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 
 # ==================== ФУНКЦИИ СЛУЖБЫ БЕЗОПАСНОСТИ ====================
@@ -223,8 +270,10 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {
         "access_token": access_token, 
         "token_type": "bearer",
-        "username": display_name  # 👈 Отдаем на фронтенд красивое ФИО вместо логина!
+        "username": display_name,  # 👈 Отдаем на фронтенд красивое ФИО вместо логина!
+        "sys_username": form_data.username # 👈 Отдаем чистый логин
     }
+
 
 
 
@@ -341,12 +390,13 @@ async def get_tasks(
 async def create_task(
     task: TaskCreate, 
     db: AsyncSession = Depends(get_db),
-    current_user: str = Depends(get_current_user)):  # 👈 ТЕПЕРЬ ТРЕБУЕТ ТОКЕН!):
-    # Теперь внутри функции в переменной current_user лежит логин того, кто делает запрос
-    # Вы можете записать его в поле `who`, если фронтенд его не прислал:
+    current_user: str = Depends(get_current_user)
+):
     task_data = task.model_dump()
+    # При создании принудительно выставляем исполнителем того, кто авторизован
     if not task_data.get("who"):
         task_data["who"] = current_user
+        
     obj_query = select(ObjectModel).where(ObjectModel.id == task.object_id)
     obj_result = await db.execute(obj_query)
     associated_object = obj_result.scalar_one_or_none()
@@ -354,22 +404,25 @@ async def create_task(
     if not associated_object:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f"Связанный объект с ID {task.object_id} не найден. Сначала создайте объект."
+            detail=f"Связанный объект не найден."
         )
         
-    db_task = TaskModel(**task.model_dump())
+    db_task = TaskModel(**task_data)
     db.add(db_task)
     await db.commit()
     await db.refresh(db_task)
     
     response_data = TaskResponse.model_validate(db_task)
     response_data.object_name = associated_object.name
-    
     return response_data
 
 @app.put("/tasks/{task_id}", response_model=TaskResponse, tags=["Tasks"])
-async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = Depends(get_db), current_user: str = Depends(get_current_user)):
-    # Запрашиваем сразу с предзагрузкой объекта, чтобы избежать ленивой загрузки
+async def update_task(
+    task_id: int, 
+    task_update: TaskUpdate, 
+    db: AsyncSession = Depends(get_db), 
+    current_user: str = Depends(get_current_user)
+):
     result = await db.execute(
         select(TaskModel).options(joinedload(TaskModel.object_rel)).where(TaskModel.id == task_id)
     )
@@ -377,13 +430,23 @@ async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = 
     if not db_task:
         raise HTTPException(status_code=404, detail="Запись не найдена")
     
+    # 🔒 ПРОВЕРКА ПРАВ: Если ты не начальник и задача чужая — отказ
+    is_boss = current_user.lower() in [b.lower() for b in BOSS_LOGINS]
+    if not is_boss and db_task.who and db_task.who.lower() != current_user.lower():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Доступ запрещен. Изменять задачу может только её исполнитель или начальник."
+        )
+
     update_data = task_update.model_dump(exclude_unset=True)
-    if not update_data.get("who"):
-        update_data["who"] = current_user
+    
+    # Защита: обычный сотрудник не может переписать исполнителя на другого человека
+    if not is_boss and "who" in update_data:
+        update_data["who"] = db_task.who 
+
     if "object_id" in update_data:
         obj_check = await db.execute(select(ObjectModel).where(ObjectModel.id == update_data["object_id"]))
-        associated_object = obj_check.scalar_one_or_none()
-        if not associated_object:
+        if not obj_check.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="Указанный Объект не найден")
 
     for key, value in update_data.items():
@@ -391,7 +454,6 @@ async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = 
         
     try:
         await db.commit()
-        # Перезапрашиваем данные из базы со связями, чтобы гарантировать актуальность object_name
         res = await db.execute(
             select(TaskModel).options(joinedload(TaskModel.object_rel)).where(TaskModel.id == task_id)
         )
@@ -402,7 +464,7 @@ async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = 
         return response_data
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"Ошибка при обновлении задачи: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Ошибка: {str(e)}")
 
 @app.delete("/tasks/{task_id}", tags=["Tasks"])
 async def delete_task(task_id: int, db: AsyncSession = Depends(get_db), current_user: str = Depends(get_current_user)):
@@ -411,9 +473,14 @@ async def delete_task(task_id: int, db: AsyncSession = Depends(get_db), current_
     if not db_task:
         raise HTTPException(status_code=404, detail="Запись не найдена")
         
+    # 🔒 ПРОВЕРКА ПРАВ НА УДАЛЕНИЕ
+    is_boss = current_user.lower() in [b.lower() for b in BOSS_LOGINS]
+    if not is_boss and db_task.who and db_task.who.lower() != current_user.lower():
+        raise HTTPException(status_code=403, detail="Удалять задачу может только её исполнитель или начальник.")
+        
     await db.delete(db_task)
     await db.commit()
-    return {"status": "success", "message": f"Запись №{task_id} успешно удалена"}
+    return {"status": "success", "message": f"Запись успешно удалена"}
 
 @app.put("/objects/{obj_id}", response_model=ObjectResponse, tags=["Objects"])
 async def update_object(obj_id: int, obj_update: ObjectBase, db: AsyncSession = Depends(get_db), current_user: str = Depends(get_current_user)):
@@ -452,3 +519,65 @@ async def delete_object(obj_id: int, db: AsyncSession = Depends(get_db), current
     await db.commit()
     return {"status": "success", "message": f"Объект '{db_obj.name}' успешно удален"}
 
+
+@app.get("/tasks/analytics/", response_model=AnalyticsResponse, tags=["Analytics"])
+async def get_tasks_analytics(
+    period: str = "month", # "month" или "year"
+    db: AsyncSession = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
+    # Определяем временные границы периода
+    today = datetime.date.today()
+    if period == "year":
+        start_date = datetime.date(today.year, 1, 1)
+        end_date = datetime.date(today.year, 12, 31)
+    else: # по умолчанию за текущий месяц
+        start_date = datetime.date(today.year, today.month, 1)
+        if today.month == 12:
+            end_date = datetime.date(today.year + 1, 1, 1) - datetime.timedelta(days=1)
+        else:
+            end_date = datetime.date(today.year, today.month + 1, 1) - datetime.timedelta(days=1)
+
+    # Базовое условие фильтрации по датам
+    date_filter = TaskModel.date.between(start_date, end_date)
+
+    # 1. Статистика в разрезе Объектов (Установок)
+    obj_query = (
+        select(ObjectModel.name, func.count(TaskModel.id))
+        .join(TaskModel.object_rel)
+        .where(date_filter)
+        .group_by(ObjectModel.name)
+        .order_by(func.count(TaskModel.id).desc())
+    )
+    obj_res = await db.execute(obj_query)
+    by_objects = [{"object_name": row[0], "count": row[1]} for row in obj_res.all()]
+
+    # 2. Статистика в разрезе Исполнителей (Сотрудников)
+    user_query = (
+        select(TaskModel.who, func.count(TaskModel.id))
+        .where(date_filter)
+        .group_by(TaskModel.who)
+        .order_by(func.count(TaskModel.id).desc())
+    )
+    user_res = await db.execute(user_query)
+    by_users = [{"who": row[0] if row[0] else "Не указан", "count": row[1]} for row in user_res.all()]
+
+    # 3. Статистика по Статусам
+    status_query = (
+        select(TaskModel.status, func.count(TaskModel.id))
+        .where(date_filter)
+        .group_by(TaskModel.status)
+        .order_by(func.count(TaskModel.id).desc())
+    )
+    status_res = await db.execute(status_query)
+    by_statuses = [{"status": row[0], "count": row[1]} for row in status_res.all()]
+
+    # Общее количество задач за выбранный период
+    total_tasks = sum(item["count"] for item in by_statuses)
+
+    return {
+        "by_objects": by_objects,
+        "by_users": by_users,
+        "by_statuses": by_statuses,
+        "total_tasks": total_tasks
+    }
