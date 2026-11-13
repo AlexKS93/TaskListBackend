@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (create_async_engine,
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.orm import joinedload
 from sqlalchemy import ForeignKey, select, or_, and_, func
+from sqlalchemy import text
 
 # 🔌 ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ИЗ .ENV
 from dotenv import load_dotenv
@@ -38,9 +39,10 @@ raw_boss_logins = os.getenv("BOSS_LOGINS", "admin")
 BOSS_LOGINS = [login.strip() for login in raw_boss_logins.split(",")]
 
 
+
 #DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./database.db")
 # ==============================================================================
-BOSS_LOGINS = ["aleksandr.skabelkin", "admin", "chief_asutp"] 
+#BOSS_LOGINS = ["aleksandr.skabelkin","aleksandr.rudenko","mihail.zikeev", "admin", "chief_asutp"] #
 # fastapi инструмент для извлечения токена из заголовка Authorization: Bearer <TOKEN>
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -62,11 +64,7 @@ class TokenResponse(BaseModel):
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./database.db")
 
 # Конфигурация аргументов подключения в зависимости от СУБД и Операционной Системы
-connect_args = {}
-if "sqlite" in DATABASE_URL:
-    # check_same_thread=False необходим для асинхронной работы SQLite в FastAPI,
-    # но мы безопасно изолируем его для стабильности под управлением разных ОС.
-    connect_args["check_same_thread"] = False
+connect_args = {"check_same_thread": False, "timeout": 30} if "sqlite" in DATABASE_URL else {}
 
 engine = create_async_engine(
     DATABASE_URL, 
@@ -167,7 +165,11 @@ class AnalyticsResponse(BaseModel):
     by_statuses: List[StatusStat]
     total_tasks: int
 
-
+class BossModel(Base):
+    __tablename__ = "bosses"
+    
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(unique=True, index=True)
 
 # 4. Инициализация FastAPI и CORS
 app = FastAPI(title="Task & Object Management API")
@@ -227,60 +229,81 @@ def authenticate_via_ldap(username: str, password: str) -> bool:
         return False
     return False
 
-def create_access_token(username: str) -> str:
-    """Генерация JWT токена"""
-    expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode = {"sub": username, "exp": expire}
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
+def create_access_token(username: str, display_name: str):
+    expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Сохраняем в токен и логин (sub), и ФИО (name)
+    to_encode = {"sub": username, "name": display_name, "exp": expire}
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
-    """Зависимость для проверки JWT токена в защищенных эндпоинтах"""
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Не удалось валидировать учетные данные",
+        detail="Не удалось проверить учетные данные",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         username: str = payload.get("sub")
+        display_name: str = payload.get("name", username)
         if username is None:
             raise credentials_exception
-        return username
+        return {"username": username, "display_name": display_name}
     except jwt.PyJWTError:
         raise credentials_exception
 
 # ==================== ЭНДПОИНТ АВТОРИЗАЦИИ ====================
+async def check_is_boss(db: AsyncSession, username: str) -> bool:
+    if not username:
+        return False
+    res = await db.execute(
+        select(BossModel).where(func.lower(BossModel.username) == username.strip().lower())
+    )
+    return res.scalar_one_or_none() is not None
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    username: str
+    sys_username: str
+    is_boss: bool # Передаем флаг прав на фронтенд
+
 
 @app.post("/auth/login", response_model=TokenResponse, tags=["Auth"])
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    # Теперь функция возвращает строку с ФИО или None
-    display_name = authenticate_via_ldap(form_data.username, form_data.password)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+    # Выполняем синхронный LDAP-запрос в отдельном потоке, чтобы не блокировать сервер
+    import asyncio
+    display_name = await asyncio.to_thread(authenticate_via_ldap, form_data.username, form_data.password)
     
     if not display_name:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Неверный логин или пароль корпоративной сети"
-        )
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
         
-    # В JWT-токен (sub) по-прежнему лучше зашивать уникальный логин (username),
-    # чтобы по нему бэкенд однозначно идентифицировал пользователя при защищенных запросах.
-    access_token = create_access_token(username=form_data.username)
+    is_boss = await check_is_boss(db, form_data.username)
+    access_token = create_access_token(username=form_data.username, display_name=display_name)
     
     return {
         "access_token": access_token, 
         "token_type": "bearer",
-        "username": display_name,  # 👈 Отдаем на фронтенд красивое ФИО вместо логина!
-        "sys_username": form_data.username # 👈 Отдаем чистый логин
+        "username": display_name,
+        "sys_username": form_data.username,
+        "is_boss": is_boss
     }
-
-
-
 
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if "sqlite" in DATABASE_URL:
+            await conn.execute(text("PRAGMA journal_mode=WAL;"))
+            await conn.execute(text("PRAGMA synchronous=NORMAL;"))
+        
+    # Начальное заполнение списка начальников из .env, если таблица пустая
+    async with async_session() as session:
+        result = await session.execute(select(BossModel).limit(1))
+        if not result.scalar_one_or_none():
+            for login in BOSS_LOGINS:
+                if login:
+                    session.add(BossModel(username=login.strip().lower()))
+            await session.commit()
 
 # ==================== ЭНДПОИНТЫ ДЛЯ ОБЪЕКТОВ ====================
 
@@ -384,18 +407,39 @@ async def get_tasks(
         results=task_list
     )
 
+@app.get("/users/list/", response_model=List[str], tags=["Users"])
+async def get_unique_executors(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    query = (
+        select(TaskModel.who)
+        .where(TaskModel.who.isnot(None), TaskModel.who != "")
+        .distinct()
+        .order_by(TaskModel.who.asc())
+    )
+    result = await db.execute(query)
+    # Очищаем пробелы и убираем возможные дубликаты по регистру
+    users = sorted(list({name.strip() for name in result.scalars().all() if name.strip()}))
+    return users
 
 
 @app.post("/tasks/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED, tags=["Tasks"])
 async def create_task(
     task: TaskCreate, 
     db: AsyncSession = Depends(get_db),
-    current_user: str = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
     task_data = task.model_dump()
-    # При создании принудительно выставляем исполнителем того, кто авторизован
-    if not task_data.get("who"):
-        task_data["who"] = current_user
+    
+    # Проверяем, является ли пользователь начальником
+    login = current_user["username"].lower()
+    is_boss = await check_is_boss(db, login)
+    
+    # Если не начальник — принудительно ставим исполнителем самого автора запроса.
+    # Если начальник и поле 'who' оставлено пустым — ставим его имя по умолчанию.
+    if not is_boss or not task_data.get("who"):
+        task_data["who"] = current_user["display_name"]
         
     obj_query = select(ObjectModel).where(ObjectModel.id == task.object_id)
     obj_result = await db.execute(obj_query)
@@ -404,7 +448,7 @@ async def create_task(
     if not associated_object:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f"Связанный объект не найден."
+            detail="Связанный объект не найден."
         )
         
     db_task = TaskModel(**task_data)
@@ -416,12 +460,13 @@ async def create_task(
     response_data.object_name = associated_object.name
     return response_data
 
+
 @app.put("/tasks/{task_id}", response_model=TaskResponse, tags=["Tasks"])
 async def update_task(
     task_id: int, 
     task_update: TaskUpdate, 
     db: AsyncSession = Depends(get_db), 
-    current_user: str = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
     result = await db.execute(
         select(TaskModel).options(joinedload(TaskModel.object_rel)).where(TaskModel.id == task_id)
@@ -430,19 +475,24 @@ async def update_task(
     if not db_task:
         raise HTTPException(status_code=404, detail="Запись не найдена")
     
-    # 🔒 ПРОВЕРКА ПРАВ: Если ты не начальник и задача чужая — отказ
-    is_boss = current_user.lower() in [b.lower() for b in BOSS_LOGINS]
-    if not is_boss and db_task.who and db_task.who.lower() != current_user.lower():
+    # Проверка прав по логину И по ФИО
+    login = current_user["username"].lower()
+    full_name = current_user["display_name"].lower()
+    is_boss = await check_is_boss(db, login)
+    
+    task_owner = (db_task.who or "").strip().lower()
+    if not is_boss and task_owner and task_owner not in (login, full_name):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail="Доступ запрещен. Изменять задачу может только её исполнитель или начальник."
         )
 
+    # Извлекаем переданные поля для обновления
     update_data = task_update.model_dump(exclude_unset=True)
-    
+
     # Защита: обычный сотрудник не может переписать исполнителя на другого человека
     if not is_boss and "who" in update_data:
-        update_data["who"] = db_task.who 
+        update_data["who"] = db_task.who
 
     if "object_id" in update_data:
         obj_check = await db.execute(select(ObjectModel).where(ObjectModel.id == update_data["object_id"]))
@@ -466,21 +516,29 @@ async def update_task(
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"Ошибка: {str(e)}")
 
+
 @app.delete("/tasks/{task_id}", tags=["Tasks"])
-async def delete_task(task_id: int, db: AsyncSession = Depends(get_db), current_user: str = Depends(get_current_user)):
+async def delete_task(
+    task_id: int, 
+    db: AsyncSession = Depends(get_db), 
+    current_user: dict = Depends(get_current_user)
+):
     result = await db.execute(select(TaskModel).where(TaskModel.id == task_id))
     db_task = result.scalar_one_or_none()
     if not db_task:
         raise HTTPException(status_code=404, detail="Запись не найдена")
         
-    # 🔒 ПРОВЕРКА ПРАВ НА УДАЛЕНИЕ
-    is_boss = current_user.lower() in [b.lower() for b in BOSS_LOGINS]
-    if not is_boss and db_task.who and db_task.who.lower() != current_user.lower():
+    login = current_user["username"].lower()
+    full_name = current_user["display_name"].lower()
+    is_boss = await check_is_boss(db, login)
+    
+    task_owner = (db_task.who or "").strip().lower()
+    if not is_boss and task_owner and task_owner not in (login, full_name):
         raise HTTPException(status_code=403, detail="Удалять задачу может только её исполнитель или начальник.")
         
     await db.delete(db_task)
     await db.commit()
-    return {"status": "success", "message": f"Запись успешно удалена"}
+    return {"status": "success", "message": "Запись успешно удалена"}
 
 @app.put("/objects/{obj_id}", response_model=ObjectResponse, tags=["Objects"])
 async def update_object(obj_id: int, obj_update: ObjectBase, db: AsyncSession = Depends(get_db), current_user: str = Depends(get_current_user)):
